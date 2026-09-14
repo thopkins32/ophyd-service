@@ -14,28 +14,25 @@ classifiers = [
 ]
 description = "REST API Server for Ophyd Objects."
 dependencies = [
-    "alembic",
-    "bluesky-queueserver",
-    "cachetools",
     "fastapi",
-    "httpx",
-    "ldap3",
-    "orjson",
-    "pamela",
-    "pydantic >=2, <3",
-    "pydantic-settings >=2",
-    "python-jose",
-    "pyzmq",
-    "sqlalchemy >=2",
-    "starlette",
+    "numpy",
+    "ophyd>=1.11.2,<2",
+    "ophyd-async>=0.21.2,<0.22",
+    "orjson>=3.10,<4",
+    "pydantic>=2,<3",
     "uvicorn",
+    "websockets",
 ]
 dynamic = ["version"]
 license = { file = "LICENSE" }
 readme = "README.rst"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 
 [project.optional-dependencies]
+ca = ["caproto>=0.4.2rc1,!=1.2.0", "ophyd-async[ca]>=0.21.2,<0.22"]
+pva = ["ophyd-async[pva]>=0.21.2,<0.22"]
+tango = ["ophyd-async[tango]>=0.21.2,<0.22"]
+sim = ["ophyd-async[sim]>=0.21.2,<0.22"]
 dev = [
     "codecov",
     "coverage",
@@ -43,6 +40,7 @@ dev = [
     "cryptography",
     "fastapi[all]",
     "flake8",
+    "httpx",
     "pre-commit",
     "pytest",
     "pytest-asyncio",
@@ -63,6 +61,7 @@ dev = [
 ]
 
 [project.scripts]
+ophyd-service = "ophyd_as_service.cli:main"
 
 [project.urls]
 GitHub = "https://github.com/dmgav/ophyd-as-service"
@@ -91,8 +90,8 @@ filterwarnings = [
     "ignore::UserWarning",
     "ignore::DeprecationWarning",
 ]
-# Doctest python code in docs, python code in src docstrings, test functions in tests
-testpaths = "src/tests"
+# Restrict discovery to service tests, excluding reference source checkouts.
+testpaths = ["tests"]
 
 [tool.coverage.run]
 data_file = "/tmp/ophyd_as_service.coverage"

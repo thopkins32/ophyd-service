@@ -1,0 +1,15 @@
+connect_timeout = 10.0
+read_timeout = 5.0
+
+[devices.temperature]
+class = "ophyd:Signal"
+[devices.temperature.kwargs]
+value = 1.0
+timestamp = 1000.0
+
+[devices.axis]
+class = "ophyd_async.sim:SimMotor"
+[devices.axis.kwargs]
+initial_value = 2.5
+instant = true
+units = "mm"

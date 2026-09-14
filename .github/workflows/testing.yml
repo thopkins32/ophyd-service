@@ -18,10 +18,6 @@ jobs:
         # Need this to get version number from last tag
         fetch-depth: 0
 
-    - uses: shogo82148/actions-setup-redis@v1
-      with:
-        redis-version: "7.x"
-
     - uses: prefix-dev/setup-pixi@v0.10.0
     - name: Install dependencies
       run: |
@@ -33,6 +29,7 @@ jobs:
     - name: Test with pytest
       env:
         PYTEST_ADDOPTS: "--durations=20"
+        OPHYD_CONTROL_LAYER: "dummy"
       run: |
         pixi run --environment=${{ matrix.python-env }} coverage run -m pytest -vv
         pixi run --environment=${{ matrix.python-env }} coverage report -m
