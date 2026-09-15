@@ -15,10 +15,10 @@ from tests.devices import MutationGuard, ObservedAsyncSignalR, ObservedSignal
 
 
 @contextmanager
-def serving(tmp_path, text):
+def serving(tmp_path, text, *, entra):
     path = tmp_path / "devices.toml"
-    path.write_text(text)
-    with TestClient(create_app(load_config(path))) as client:
+    path.write_text(entra.toml + text)
+    with TestClient(create_app(load_config(path)), headers=entra.headers) as client:
         yield client, client.app.state.registry
 
 
@@ -55,7 +55,7 @@ def assert_error(response, status, code, path):
 
 
 @pytest.fixture
-def paired_service(tmp_path, monkeypatch):
+def paired_service(tmp_path, monkeypatch, entra):
     stage_attempts = []
 
     def forbid_stage(signal, *args, **kwargs):
@@ -73,6 +73,7 @@ class = "tests.devices:ClassicDevice"
 [devices.async]
 class = "tests.devices:AsyncDevice"
 """,
+        entra=entra,
     ) as (client, registry):
         classic = registry.roots["classic"]
         asynchronous = registry.roots["async"]
@@ -213,13 +214,14 @@ def test_catalog_is_lazy_and_literal_paths_do_not_expand_native_reads(paired_ser
     )
 
 
-def test_sparse_vectors_and_declared_private_children_are_discoverable(tmp_path):
+def test_sparse_vectors_and_declared_private_children_are_discoverable(tmp_path, entra):
     with serving(
         tmp_path,
         """
 [devices.everything]
 class = "ophyd_async.testing:ParentOfEverythingDevice"
 """,
+        entra=entra,
     ) as (client, registry):
         root = registry.roots["everything"]
         children = get_json(client, "/api/v1/resources/everything")["children"]
@@ -244,7 +246,7 @@ class = "ophyd_async.testing:ParentOfEverythingDevice"
         assert_error(client.get("/api/v1/read/everything"), 409, "not_readable", "everything")
 
 
-def test_sim_motor_root_and_leaf_share_native_name_without_path_collision(tmp_path):
+def test_sim_motor_root_and_leaf_share_native_name_without_path_collision(tmp_path, entra):
     with serving(
         tmp_path,
         """
@@ -255,6 +257,7 @@ initial_value = 2.5
 instant = true
 units = "mm"
 """,
+        entra=entra,
     ) as (client, registry):
         motor = registry.roots["axis"]
         native = await_on_loop(registry, motor.user_readback.read(cached=False))
@@ -273,7 +276,7 @@ units = "mm"
         assert await_on_loop(registry, motor.user_setpoint.get_value()) == 2.5
 
 
-def test_native_config_only_device_stays_empty_and_array_enum_table_leaves_preserve_shape(tmp_path):
+def test_native_config_only_device_stays_empty_and_array_enum_table_leaves_preserve_shape(tmp_path, entra):
     from tests.test_subscriptions import _subscribe
 
     with serving(
@@ -282,6 +285,7 @@ def test_native_config_only_device_stays_empty_and_array_enum_table_leaves_prese
 [devices.data]
 class = "ophyd_async.testing:OneOfEverythingDevice"
 """,
+        entra=entra,
     ) as (client, registry):
         assert get_json(client, "/api/v1/read/data") == {"path": "data", "readings": {}}
         assert get_json(client, "/api/v1/describe/data") == {"path": "data", "data_keys": {}}
@@ -341,7 +345,7 @@ class EdgeValuesSignal(ObservedSignal):
         super().__init__(name=name, value=self.payload, timestamp=1000.0)
 
 
-def test_wire_normalization_preserves_integer_precision_and_does_not_mutate_native_arrays(tmp_path):
+def test_wire_normalization_preserves_integer_precision_and_does_not_mutate_native_arrays(tmp_path, entra):
     from tests.test_subscriptions import _receive, _subscribe
 
     with serving(
@@ -350,6 +354,7 @@ def test_wire_normalization_preserves_integer_precision_and_does_not_mutate_nati
 [devices.edges]
 class = "tests.test_package:EdgeValuesSignal"
 """,
+        entra=entra,
     ) as (client, registry):
         signal = registry.roots["edges"]
         original_bytes = signal.matrix.tobytes()
@@ -407,7 +412,7 @@ class MutableReadingSignal(ObservedAsyncSignalR):
         super().__init__(backend=self.fixture_backend, name=name)
 
 
-def test_async_callback_handoff_owns_mutable_array_and_reading_metadata(tmp_path):
+def test_async_callback_handoff_owns_mutable_array_and_reading_metadata(tmp_path, entra):
     from tests.test_subscriptions import _receive, _subscribe
 
     with serving(
@@ -416,6 +421,7 @@ def test_async_callback_handoff_owns_mutable_array_and_reading_metadata(tmp_path
 [devices.handoff]
 class = "tests.test_package:MutableReadingSignal"
 """,
+        entra=entra,
     ) as (client, registry):
         signal = registry.roots["handoff"]
         with client.websocket_connect("/api/v1/ws") as ws:
@@ -461,7 +467,7 @@ class = "tests.test_package:MutableReadingSignal"
     assert signal.forbidden_calls == []
 
 
-def test_direct_async_read_fetches_silent_getter_change_instead_of_monitor_cache(tmp_path):
+def test_direct_async_read_fetches_silent_getter_change_instead_of_monitor_cache(tmp_path, entra):
     from tests.test_subscriptions import _receive, _subscribe
 
     with serving(
@@ -470,6 +476,7 @@ def test_direct_async_read_fetches_silent_getter_change_instead_of_monitor_cache
 [devices.state]
 class = "tests.devices:StateBackedAsyncDevice"
 """,
+        entra=entra,
     ) as (client, registry):
         root = registry.roots["state"]
         signal = root.temperature
@@ -492,7 +499,7 @@ class = "tests.devices:StateBackedAsyncDevice"
     assert signal.forbidden_calls == []
 
 
-def test_classic_timeout_keeps_native_work_serialized_while_async_root_remains_usable(tmp_path):
+def test_classic_timeout_keeps_native_work_serialized_while_async_root_remains_usable(tmp_path, entra):
     from tests.test_subscriptions import _receive, _subscribe
 
     with serving(
@@ -504,6 +511,7 @@ class = "tests.devices:GatedSignal"
 [devices.async]
 class = "tests.devices:AsyncDevice"
 """,
+        entra=entra,
     ) as (client, registry):
         blocked = registry.roots["blocked"]
         blocked.read_release.clear()
@@ -537,7 +545,7 @@ class = "tests.devices:AsyncDevice"
     assert not blocked.destroyed_while_reading
 
 
-def test_native_read_error_keeps_type_message_and_can_recover(tmp_path):
+def test_native_read_error_keeps_type_message_and_can_recover(tmp_path, entra):
     with serving(
         tmp_path,
         """
@@ -546,6 +554,7 @@ class = "tests.devices:GatedSignal"
 [devices.failing.kwargs]
 fail_read = "native fixture read failed"
 """,
+        entra=entra,
     ) as (client, registry):
         error = assert_error(client.get("/api/v1/read/failing"), 502, "backend_error", "failing")
         assert "RuntimeError" in error["message"]
@@ -580,7 +589,7 @@ class FailingLazyDevice(MutationGuard, Device):
     ],
 )
 def test_known_lazy_failures_are_backend_errors_not_missing_resources(
-    tmp_path, operation, child, error_type, message
+    tmp_path, operation, child, error_type, message, entra
 ):
     with serving(
         tmp_path,
@@ -588,6 +597,7 @@ def test_known_lazy_failures_are_backend_errors_not_missing_resources(
 [devices.lazy]
 class = "tests.test_package:FailingLazyDevice"
 """,
+        entra=entra,
     ) as (client, registry):
         path = f"lazy/{child}"
         assert path in get_json(client, "/api/v1/resources/lazy")["children"]

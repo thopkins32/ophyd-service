@@ -1,5 +1,6 @@
 import asyncio
 import importlib
+import json
 from pathlib import Path
 
 import pytest
@@ -7,23 +8,28 @@ from fastapi.testclient import TestClient
 from ophyd import Signal
 from ophyd_async.core import Device as AsyncDevice
 from ophyd_async.core import DeviceConnector, SignalR, soft_signal_r_and_setter
+from pydantic import ValidationError
 
 from ophyd_as_service.api import create_app
 from ophyd_as_service.config import ServiceConfig, load_config
 from ophyd_as_service.devices import DeviceRegistry
+from ophyd_as_service.errors import ServiceError
 
 
-def test_parse_complete_config_before_import(tmp_path, monkeypatch):
+def test_parse_complete_config_before_import(tmp_path, monkeypatch, entra):
     path = tmp_path / "devices.toml"
-    path.write_text("""
-[devices.classic]
-class = "uninstalled_driver:Device"
-[devices.classic.kwargs]
-prefix = "SIM:"
-channels = [1, 3]
-[devices.async]
-class = "another_driver:Device"
-""")
+    path.write_text(
+        entra.toml
+        + """
+    [devices.classic]
+    class = "uninstalled_driver:Device"
+    [devices.classic.kwargs]
+    prefix = "SIM:"
+    channels = [1, 3]
+    [devices.async]
+    class = "another_driver:Device"
+    """
+    )
 
     def unexpected_import(name):
         pytest.fail(f"configuration parsing imported {name}")
@@ -34,14 +40,186 @@ class = "another_driver:Device"
     assert config.devices["classic"].kwargs == {"prefix": "SIM:", "channels": [1, 3]}
 
 
-def test_explicit_empty_devices(tmp_path):
+def test_explicit_empty_devices(tmp_path, entra):
     path = tmp_path / "empty.toml"
-    path.write_text("[devices]\n")
-    assert load_config(path).devices == {}
-    with TestClient(create_app(load_config(path))) as client:
+    path.write_text(entra.toml + "[devices]\n")
+    config = load_config(path)
+    assert config.devices == {}
+    assert config.auth.allowed_origins == []
+    with TestClient(create_app(config), headers=entra.headers) as client:
         response = client.get("/api/v1/devices")
         assert response.status_code == 200
         assert response.json() == {"devices": []}
+
+
+def test_inline_auth_preserves_root_timeouts(tmp_path, entra):
+    path = tmp_path / "timeouts.toml"
+    path.write_text(entra.toml + "connect_timeout = 0.125\nread_timeout = 0.25\n[devices]\n")
+    config = load_config(path)
+    assert config.connect_timeout == 0.125
+    assert config.read_timeout == 0.25
+
+
+@pytest.mark.parametrize(
+    ("auth_text", "location"),
+    [
+        pytest.param("", ("auth",), id="missing-auth"),
+        pytest.param("[auth]\n", ("auth", "profile"), id="missing-profile"),
+        pytest.param(
+            '[auth.profile]\ntenant_id = "{tenant_id}"\napi_client_id = "{api_client_id}"\n',
+            ("auth", "profile", "type"),
+            id="missing-type",
+        ),
+        pytest.param(
+            '[auth.profile]\ntype = "generic"\ntenant_id = "{tenant_id}"\napi_client_id = "{api_client_id}"\n',
+            ("auth", "profile", "type"),
+            id="generic-not-supported",
+        ),
+        pytest.param(
+            '[auth.profile]\ntype = "oidc"\ntenant_id = "{tenant_id}"\napi_client_id = "{api_client_id}"\n',
+            ("auth", "profile", "type"),
+            id="other-provider-not-supported",
+        ),
+        pytest.param(
+            '[auth]\ntype = "entra"\ntenant_id = "{tenant_id}"\napi_client_id = "{api_client_id}"\n',
+            ("auth", "type"),
+            id="flat-profile-not-supported",
+        ),
+        pytest.param(
+            '[auth]\n[profile]\ntype = "entra"\ntenant_id = "{tenant_id}"\napi_client_id = "{api_client_id}"\n',
+            ("profile",),
+            id="misplaced-root-profile",
+        ),
+    ],
+)
+def test_auth_requires_explicit_nested_entra_profile(tmp_path, monkeypatch, entra, auth_text, location):
+    path = tmp_path / "invalid-auth.toml"
+    path.write_text(
+        auth_text.format(tenant_id=entra.tenant_id, api_client_id=entra.api_client_id)
+        + '[devices.root]\nclass = "uninstalled_driver:Device"\n'
+    )
+
+    def unexpected_import(name):
+        pytest.fail(f"invalid authentication configuration imported {name}")
+
+    monkeypatch.setattr(importlib, "import_module", unexpected_import)
+    with pytest.raises(ValueError) as error:
+        load_config(path)
+    assert str(path) in str(error.value)
+    assert isinstance(error.value.__cause__, ValidationError)
+    assert location in {entry["loc"] for entry in error.value.__cause__.errors()}
+
+
+@pytest.mark.parametrize(
+    ("table", "field", "value"),
+    [
+        ("auth", "disable", "true"),
+        ("auth", "client_secret", '"not-a-secret"'),
+        ("auth", "issuer", '"https://issuer.example.test"'),
+        ("auth", "import_path", '"arbitrary_module:Profile"'),
+        ("auth.profile", "client_secret", '"not-a-secret"'),
+        ("auth.profile", "allowed_origins", "[]"),
+    ],
+)
+def test_auth_rejects_unknown_options(tmp_path, entra, table, field, value):
+    path = tmp_path / "unknown-auth-option.toml"
+    option = f"{field} = {value}\n"
+    path.write_text(
+        "[auth]\n"
+        + (option if table == "auth" else "")
+        + '[auth.profile]\ntype = "entra"\n'
+        + f'tenant_id = "{entra.tenant_id}"\napi_client_id = "{entra.api_client_id}"\n'
+        + (option if table == "auth.profile" else "")
+        + "[devices]\n"
+    )
+    with pytest.raises(ValueError) as error:
+        load_config(path)
+    assert str(path) in str(error.value)
+    assert isinstance(error.value.__cause__, ValidationError)
+    location = (*table.split("."), field)
+    assert any(
+        entry["loc"] == location and entry["type"] == "extra_forbidden" for entry in error.value.__cause__.errors()
+    )
+
+
+@pytest.mark.parametrize("field", ["tenant_id", "api_client_id"])
+@pytest.mark.parametrize("value", [None, "not-a-uuid"], ids=["missing", "invalid"])
+def test_entra_profile_requires_uuid_identifiers(tmp_path, entra, field, value):
+    identifiers = {"tenant_id": entra.tenant_id, "api_client_id": entra.api_client_id}
+    identifiers[field] = value
+    path = tmp_path / "invalid-identifier.toml"
+    path.write_text(
+        '[auth.profile]\ntype = "entra"\n'
+        + "".join(f"{name} = {json.dumps(identifier)}\n" for name, identifier in identifiers.items() if identifier)
+        + "[devices]\n"
+    )
+    with pytest.raises(ValueError) as error:
+        load_config(path)
+    assert str(path) in str(error.value)
+    assert isinstance(error.value.__cause__, ValidationError)
+    assert ("auth", "profile", field) in {entry["loc"] for entry in error.value.__cause__.errors()}
+
+
+@pytest.mark.parametrize(
+    "origin",
+    [
+        "null",
+        "*",
+        "https://*.example.test",
+        "https:///missing-host",
+        "ftp://reader.example.test",
+        "http://reader.example.test",
+        "http://192.0.2.10",
+        "http://localhost.example.test",
+        "https://user:password@reader.example.test",
+        "https://reader.example.test/",
+        "https://reader.example.test/path",
+        "https://reader.example.test?query=value",
+        "https://reader.example.test#fragment",
+        "https://reader.example.test:bad-port",
+        "https://reader.example.test:65536",
+        "https://[::1",
+    ],
+)
+def test_auth_rejects_invalid_browser_origins(tmp_path, entra, origin):
+    path = tmp_path / "invalid-origin.toml"
+    path.write_text(
+        f"[auth]\nallowed_origins = [{json.dumps(origin)}]\n"
+        + '[auth.profile]\ntype = "entra"\n'
+        + f'tenant_id = "{entra.tenant_id}"\napi_client_id = "{entra.api_client_id}"\n[devices]\n'
+    )
+    with pytest.raises(ValueError) as error:
+        load_config(path)
+    assert str(path) in str(error.value)
+    assert isinstance(error.value.__cause__, ValidationError)
+    assert any(entry["loc"][:2] == ("auth", "allowed_origins") for entry in error.value.__cause__.errors())
+
+
+def test_auth_preserves_additional_serialized_origins(tmp_path, entra):
+    origins = [
+        "https://reader.example.test",
+        "https://reader.example.test:443",
+        "https://192.0.2.10:8443",
+        "http://localhost:3000",
+        "http://127.0.0.2:8080",
+        "http://[::1]:3000",
+    ]
+    path = tmp_path / "browser-origins.toml"
+    path.write_text(
+        f"[auth]\nallowed_origins = {json.dumps(origins)}\n"
+        + '[auth.profile]\ntype = "entra"\n'
+        + f'tenant_id = "{entra.tenant_id}"\napi_client_id = "{entra.api_client_id}"\n[devices]\n'
+    )
+    assert load_config(path).auth.allowed_origins == origins
+
+
+def test_auth_omitting_additional_origins_keeps_same_origin_only(tmp_path, entra):
+    path = tmp_path / "same-origin.toml"
+    path.write_text(
+        '[auth.profile]\ntype = "entra"\n'
+        + f'tenant_id = "{entra.tenant_id}"\napi_client_id = "{entra.api_client_id}"\n[devices]\n'
+    )
+    assert load_config(path).auth.allowed_origins == []
 
 
 @pytest.mark.parametrize(
@@ -64,9 +242,9 @@ def test_explicit_empty_devices(tmp_path):
         "[devices",
     ],
 )
-def test_invalid_config_reports_file_and_cause(tmp_path, text):
+def test_invalid_config_reports_file_and_cause(tmp_path, text, entra):
     path = tmp_path / "invalid.toml"
-    path.write_text(text)
+    path.write_text(entra.toml + text)
     with pytest.raises(ValueError) as error:
         load_config(path)
     assert str(path) in str(error.value)
@@ -81,20 +259,30 @@ def test_missing_file_reports_path(tmp_path):
     assert isinstance(error.value.__cause__, FileNotFoundError)
 
 
-def test_class_allowlist_excludes_non_device(tmp_path):
+def test_class_allowlist_excludes_non_device(tmp_path, entra):
     path = tmp_path / "not_device.toml"
-    path.write_text('[devices.root]\nclass = "pathlib:Path"\n')
+    path.write_text(entra.toml + '[devices.root]\nclass = "pathlib:Path"\n')
     spec = load_config(path).devices["root"]
     with pytest.raises(TypeError, match="pathlib:Path"):
         spec.resolve_class()
 
 
-def test_cli_rejects_invalid_config_before_loading_driver_packages(tmp_path):
+@pytest.mark.parametrize("invalid_field", ["startup_script", "auth", "auth.profile.type"])
+def test_cli_rejects_invalid_config_before_loading_driver_packages(tmp_path, entra, invalid_field):
     import subprocess
     import sys
 
     path = tmp_path / "invalid-cli.toml"
-    path.write_text('startup_script = "unused.py"\n[devices.root]\nclass = "ophyd:Signal"\n')
+    if invalid_field == "startup_script":
+        text = entra.toml + 'startup_script = "unused.py"\n'
+    elif invalid_field == "auth":
+        text = ""
+    else:
+        text = (
+            '[auth.profile]\ntype = "generic"\n'
+            f'tenant_id = "{entra.tenant_id}"\napi_client_id = "{entra.api_client_id}"\n'
+        )
+    path.write_text(text + '[devices.root]\nclass = "ophyd:Signal"\n')
     # A fresh interpreter makes import side effects observable even when other
     # tests have already loaded both native packages. Guard the driver boundary.
     program = """
@@ -113,7 +301,7 @@ main()
     result = subprocess.run([sys.executable, "-c", program, str(path)], capture_output=True, text=True, timeout=5)
     assert result.returncode == 2, result.stderr
     assert str(path) in result.stderr
-    assert "startup_script" in result.stderr
+    assert invalid_field in result.stderr
 
 
 class LifecycleSignal(Signal):
@@ -177,19 +365,22 @@ def lifecycle_observers(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_registry_constructs_named_roots_once_from_config(tmp_path, lifecycle_observers):
+async def test_registry_constructs_named_roots_once_from_config(tmp_path, lifecycle_observers, entra):
     path = tmp_path / "lifecycle.toml"
-    path.write_text(f'''
-[devices.classic]
-class = "{__name__}:LifecycleSignal"
-[devices.classic.kwargs]
-value = 2.5
-timestamp = 1001.0
-[devices.async]
-class = "{__name__}:LifecycleAsyncDevice"
-[devices.async.kwargs]
-initial_value = 5.678
-''')
+    path.write_text(
+        entra.toml
+        + f'''
+    [devices.classic]
+    class = "{__name__}:LifecycleSignal"
+    [devices.classic.kwargs]
+    value = 2.5
+    timestamp = 1001.0
+    [devices.async]
+    class = "{__name__}:LifecycleAsyncDevice"
+    [devices.async.kwargs]
+    initial_value = 5.678
+    '''
+    )
     registry = DeviceRegistry(load_config(path))
     assert LifecycleSignal.constructed == []
     assert LifecycleAsyncDevice.constructed == []
@@ -219,9 +410,9 @@ initial_value = 5.678
 
 
 @pytest.mark.asyncio
-async def test_empty_registry_starts_and_closes(tmp_path):
+async def test_empty_registry_starts_and_closes(tmp_path, entra):
     path = tmp_path / "empty.toml"
-    path.write_text("[devices]\n")
+    path.write_text(entra.toml + "[devices]\n")
     registry = DeviceRegistry(load_config(path))
     try:
         await registry.start()
@@ -245,15 +436,16 @@ async def test_empty_registry_starts_and_closes(tmp_path):
     ids=["import", "disallowed-class", "constructor", "classic-connect", "async-connect"],
 )
 async def test_failed_start_preserves_cause_and_releases_owned_roots(
-    lifecycle_observers, class_path, kwargs, cause_type, destroyed
+    lifecycle_observers, class_path, kwargs, cause_type, destroyed, entra
 ):
     config = ServiceConfig.model_validate(
         {
+            "auth": entra.auth,
             "devices": {
                 "earlier": {"class": f"{__name__}:LifecycleSignal"},
                 "broken": {"class": class_path, "kwargs": kwargs},
                 "never": {"class": f"{__name__}:LifecycleSignal"},
-            }
+            },
         }
     )
     registry = DeviceRegistry(config)
@@ -285,7 +477,7 @@ async def test_failed_start_preserves_cause_and_releases_owned_roots(
 
 
 @pytest.mark.asyncio
-async def test_cancelled_async_connection_aborts_registry(lifecycle_observers, monkeypatch):
+async def test_cancelled_async_connection_aborts_registry(lifecycle_observers, monkeypatch, entra):
     entered = asyncio.Event()
     release = asyncio.Event()
     settled = asyncio.Event()
@@ -294,6 +486,7 @@ async def test_cancelled_async_connection_aborts_registry(lifecycle_observers, m
     monkeypatch.setattr(LifecycleAsyncDevice, "connect_settled", settled, raising=False)
     config = ServiceConfig.model_validate(
         {
+            "auth": entra.auth,
             "connect_timeout": 30.0,
             "devices": {
                 "earlier": {"class": f"{__name__}:LifecycleSignal"},
@@ -330,9 +523,10 @@ async def test_cancelled_async_connection_aborts_registry(lifecycle_observers, m
 
 
 @pytest.mark.asyncio
-async def test_close_attempts_all_roots_and_preserves_destroy_failure(lifecycle_observers):
+async def test_close_attempts_all_roots_and_preserves_destroy_failure(lifecycle_observers, entra):
     config = ServiceConfig.model_validate(
         {
+            "auth": entra.auth,
             "devices": {
                 "broken": {
                     "class": f"{__name__}:LifecycleSignal",
@@ -340,7 +534,7 @@ async def test_close_attempts_all_roots_and_preserves_destroy_failure(lifecycle_
                 },
                 "other": {"class": f"{__name__}:LifecycleSignal"},
                 "async": {"class": f"{__name__}:LifecycleAsyncDevice"},
-            }
+            },
         }
     )
     registry = DeviceRegistry(config)
@@ -353,25 +547,28 @@ async def test_close_attempts_all_roots_and_preserves_destroy_failure(lifecycle_
     assert registry.roots == {}
 
 
-def test_app_factory_defers_construction_until_lifespan(tmp_path, lifecycle_observers):
+def test_app_factory_defers_construction_until_lifespan(tmp_path, lifecycle_observers, entra):
     path = tmp_path / "app-lifecycle.toml"
-    path.write_text(f'''
-[devices.classic]
-class = "{__name__}:LifecycleSignal"
-[devices.classic.kwargs]
-value = 2.5
-timestamp = 1001.0
-[devices.async]
-class = "{__name__}:LifecycleAsyncDevice"
-[devices.async.kwargs]
-initial_value = 5.678
-''')
+    path.write_text(
+        entra.toml
+        + f'''
+    [devices.classic]
+    class = "{__name__}:LifecycleSignal"
+    [devices.classic.kwargs]
+    value = 2.5
+    timestamp = 1001.0
+    [devices.async]
+    class = "{__name__}:LifecycleAsyncDevice"
+    [devices.async.kwargs]
+    initial_value = 5.678
+    '''
+    )
     app = create_app(load_config(path))
     assert LifecycleSignal.constructed == []
     assert LifecycleAsyncDevice.constructed == []
     assert LifecycleAsyncDevice.connection_attempts == []
 
-    with TestClient(app) as client:
+    with TestClient(app, headers=entra.headers) as client:
         response = client.get("/api/v1/devices")
         assert response.status_code == 200
         assert response.json() == {"devices": ["classic", "async"]}
@@ -391,16 +588,19 @@ initial_value = 5.678
     assert LifecycleSignal.destroyed == ["classic"]
 
 
-def test_app_lifespan_reads_configured_devices_and_closes_without_mutation(tmp_path, monkeypatch):
+def test_app_lifespan_reads_configured_devices_and_closes_without_mutation(tmp_path, monkeypatch, entra):
     path = tmp_path / "readable-devices.toml"
-    path.write_text("""
-[devices.configured_classic]
-class = "tests.devices:ClassicDevice"
-[devices.configured_async]
-class = "tests.devices:AsyncDevice"
-[devices.configured_async.kwargs]
-initial_value = 5.678
-""")
+    path.write_text(
+        entra.toml
+        + """
+    [devices.configured_classic]
+    class = "tests.devices:ClassicDevice"
+    [devices.configured_async]
+    class = "tests.devices:AsyncDevice"
+    [devices.configured_async.kwargs]
+    initial_value = 5.678
+    """
+    )
     forbidden_staging = []
 
     def forbid_staging(signal):
@@ -410,7 +610,7 @@ initial_value = 5.678
     monkeypatch.setattr(SignalR, "stage", forbid_staging)
     monkeypatch.setattr(SignalR, "unstage", forbid_staging)
     app = create_app(load_config(path))
-    with TestClient(app) as client:
+    with TestClient(app, headers=entra.headers) as client:
         classic = app.state.registry.roots["configured_classic"]
         async_root = app.state.registry.roots["configured_async"]
         temperature = classic.temperature
@@ -452,21 +652,24 @@ initial_value = 5.678
     ids=["disallowed-class", "constructor", "classic-connect", "async-connect"],
 )
 def test_app_startup_failure_never_serves_and_releases_owned_roots(
-    tmp_path, lifecycle_observers, class_path, failure_phase, cause_owner, destroyed
+    tmp_path, lifecycle_observers, class_path, failure_phase, cause_owner, destroyed, entra
 ):
     path = tmp_path / "failed-lifespan.toml"
     kwargs = f'kwargs = {{failure_phase = "{failure_phase}"}}\n' if failure_phase else ""
-    path.write_text(f'''
-[devices.earlier]
-class = "{__name__}:LifecycleSignal"
-[devices.broken]
-class = "{class_path}"
-{kwargs}
-[devices.never]
-class = "{__name__}:LifecycleSignal"
-''')
+    path.write_text(
+        entra.toml
+        + f'''
+    [devices.earlier]
+    class = "{__name__}:LifecycleSignal"
+    [devices.broken]
+    class = "{class_path}"
+    {kwargs}
+    [devices.never]
+    class = "{__name__}:LifecycleSignal"
+    '''
+    )
     with pytest.raises(RuntimeError) as error:
-        with TestClient(create_app(load_config(path))):
+        with TestClient(create_app(load_config(path)), headers=entra.headers):
             pytest.fail("An application with a failed configured root became ready")
 
     assert "broken" in str(error.value)
@@ -478,3 +681,30 @@ class = "{__name__}:LifecycleSignal"
         assert error.value.__cause__ is cause_owner.failure
     assert sorted(LifecycleSignal.destroyed) == destroyed
     assert "never" not in LifecycleSignal.constructed
+
+
+@pytest.mark.parametrize("endpoint", ["discovery_route", "jwks_route", "browser-origin"])
+def test_signing_key_failure_prevents_native_root_construction(lifecycle_observers, entra, endpoint):
+    if endpoint == "browser-origin":
+        origin = "https://reader.example.test"
+        entra.auth["allowed_origins"] = [origin]
+        entra.discovery_route.respond(200, json={"issuer": entra.issuer, "jwks_uri": f"{origin}/jwks"})
+    else:
+        getattr(entra, endpoint).respond(503)
+    config = ServiceConfig.model_validate(
+        {
+            "auth": entra.auth,
+            "devices": {
+                "classic": {"class": f"{__name__}:LifecycleSignal"},
+                "async": {"class": f"{__name__}:LifecycleAsyncDevice"},
+            },
+        }
+    )
+    with pytest.raises(ServiceError) as error:
+        with TestClient(create_app(config)):
+            pytest.fail("Application became ready without signing keys")
+    assert error.value.code == "auth_unavailable"
+    assert error.value.status == 503
+    assert LifecycleSignal.constructed == []
+    assert LifecycleAsyncDevice.constructed == []
+    assert LifecycleAsyncDevice.connection_attempts == []

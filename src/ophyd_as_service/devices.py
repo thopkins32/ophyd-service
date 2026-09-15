@@ -16,31 +16,11 @@ from ophyd_async.core import Device as AsyncDevice
 from ophyd_async.core import SignalR
 
 from .config import ServiceConfig
+from .errors import ServiceError
 from .serialization import snapshot_json
 
 logger = logging.getLogger(__name__)
 T = TypeVar("T")
-
-
-class ServiceError(Exception):
-    """An operation failure safe to expose without a server traceback."""
-
-    def __init__(self, code: str, message: str, path: str | None = None):
-        super().__init__(message)
-        self.code = code
-        self.message = message
-        self.path = path
-
-    @property
-    def status(self) -> int:
-        return {
-            "not_found": 404,
-            "not_readable": 409,
-            "not_monitorable": 409,
-            "timeout": 504,
-            "backend_error": 502,
-            "serialization_error": 500,
-        }[self.code]
 
 
 def failure(code: str, path: str | None, exc: Exception) -> ServiceError:

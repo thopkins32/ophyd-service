@@ -13,6 +13,11 @@ extras. Runtime backends are released packages, not reference-source checkouts:
 * ``ophyd>=1.11.2,<2``
 * ``ophyd-async>=0.21.2,<0.22``
 
+JWT verification uses ``PyJWT[crypto]>=2.14,<3``. The transport/runtime contract
+also requires ``fastapi>=0.141.1,<1`` and ``httpx>=0.28.1,<1``. Use the declared
+environment and lockfile rather than substituting a verifier or lowering the
+security release floor.
+
 Configured driver modules must already be installed in the service's environment.
 The server does not install packages, select transports dynamically, or add
 driver directories to the Python import path. Declare driver and transport
@@ -50,7 +55,10 @@ uses ``OPHYD_CONTROL_LAYER=dummy`` and needs no IOC or live device.
 Pixi development environment
 ============================
 
-Run these commands from the repository root with Pixi available:
+Run from the repository root with Pixi available. Installing and running tests
+requires no real Entra credentials. Before launching the example, complete
+:ref:`entra-deployment` and replace its deliberately invalid tenant/API UUID
+placeholders. Hardware-free operation still requires authentication.
 
 .. code-block:: console
 
@@ -80,6 +88,7 @@ rewriting files:
    pixi run --environment py311 ruff check src tests
    pixi run --environment py311 ruff format --check src tests
 
-The service tests use soft/in-memory devices; they do not establish native
-transport correctness or the safety of site hardware. Do not point automated
-checks at a live control system.
+The service tests use soft/in-memory devices, real RSA-signed tokens and mocked
+discovery/JWKS HTTP endpoints. They do not contact Entra or establish real-tenant
+policy, native transport correctness or site-hardware safety. Do not point
+automated checks at a live control system.

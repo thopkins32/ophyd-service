@@ -1,10 +1,13 @@
 """Trusted, data-only device construction configuration."""
 
 import importlib
+import ipaddress
 import re
 import tomllib
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
+from urllib.parse import urlsplit
+from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError, field_validator
 
@@ -42,9 +45,55 @@ class DeviceSpec(BaseModel):
         return driver
 
 
+class EntraProfileConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["entra"]
+    tenant_id: UUID
+    api_client_id: UUID
+
+
+class AuthConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    profile: EntraProfileConfig
+    allowed_origins: list[str] = Field(default_factory=list)
+
+    @field_validator("allowed_origins")
+    @classmethod
+    def serialized_origins(cls, origins: list[str]) -> list[str]:
+        for origin in origins:
+            parsed = urlsplit(origin)
+            port = parsed.port  # Access also rejects malformed/out-of-range ports.
+            if (
+                parsed.scheme not in {"http", "https"}
+                or not parsed.hostname
+                or parsed.username is not None
+                or parsed.password is not None
+                or parsed.path
+                or "?" in origin
+                or "#" in origin
+                or "*" in origin
+                or any(character.isspace() or ord(character) < 32 or ord(character) == 127 for character in origin)
+                or (port is None and parsed.netloc.endswith(":"))
+            ):
+                raise ValueError(
+                    "allowed_origins must contain serialized browser origins without a trailing slash"
+                )
+            if parsed.scheme == "http" and parsed.hostname != "localhost":
+                try:
+                    loopback = ipaddress.ip_address(parsed.hostname).is_loopback
+                except ValueError:
+                    loopback = False
+                if not loopback:
+                    raise ValueError("HTTP origins are permitted only for localhost or loopback IP addresses")
+        return origins
+
+
 class ServiceConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    auth: AuthConfig
     devices: dict[str, DeviceSpec]
     connect_timeout: Annotated[float, Field(gt=0, allow_inf_nan=False)] = 10.0
     read_timeout: Annotated[float, Field(gt=0, allow_inf_nan=False)] = 5.0

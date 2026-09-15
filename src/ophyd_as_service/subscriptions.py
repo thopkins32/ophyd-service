@@ -8,6 +8,7 @@ import threading
 from collections import OrderedDict
 from dataclasses import dataclass
 from functools import partial
+from time import time
 from typing import Any, Literal
 
 import orjson
@@ -15,7 +16,8 @@ from fastapi import WebSocket, WebSocketDisconnect
 from ophyd import Signal
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from .devices import DeviceRegistry, ServiceError, failure
+from .devices import DeviceRegistry, failure
+from .errors import ServiceError
 from .serialization import encode_json, snapshot_json
 
 WS_MAX_MESSAGE_BYTES = 65536
@@ -39,6 +41,14 @@ def _error(error: ServiceError, path: str | None, id: str | None = None) -> dict
     return {"type": "error", "id": id, "path": path, "code": error.code, "message": error.message}
 
 
+async def _close_websocket(websocket: WebSocket, code: int, reason: str = "") -> None:
+    """Bound best-effort closure without interrupting owned cleanup."""
+    try:
+        await asyncio.wait_for(websocket.close(code=code, reason=reason), WS_SEND_TIMEOUT)
+    except (TimeoutError, WebSocketDisconnect, OSError, RuntimeError) as exc:
+        logger.warning("Could not deliver WebSocket close %s (%s)", code, type(exc).__name__)
+
+
 @dataclass(eq=False)
 class _Membership:
     session: _Session
@@ -55,8 +65,9 @@ class _Control:
 
 
 class _CloseSocket(Exception):
-    def __init__(self, code: int):
+    def __init__(self, code: int, reason: str = ""):
         self.code = code
+        self.reason = reason
 
 
 class _Source:
@@ -216,11 +227,13 @@ class SubscriptionBroker:
         task.add_done_callback(finished)
         return task
 
-    async def serve(self, websocket: WebSocket) -> None:
-        if self._closing:
-            await websocket.close(code=1013)
+    async def serve(self, websocket: WebSocket, *, expires_at: float) -> None:
+        expired = expires_at <= time()
+        if self._closing or expired:
+            code, reason = (1008, "token_expired") if expired else (1013, "")
+            await _close_websocket(websocket, code, reason)
             return
-        session = _Session(self, websocket)
+        session = _Session(self, websocket, expires_at=expires_at)
         self._sessions.add(session)
         try:
             await session.run()
@@ -335,9 +348,10 @@ class SubscriptionBroker:
 
 
 class _Session:
-    def __init__(self, broker: SubscriptionBroker, websocket: WebSocket):
+    def __init__(self, broker: SubscriptionBroker, websocket: WebSocket, *, expires_at: float):
         self.broker = broker
         self.websocket = websocket
+        self.expires_at = expires_at
         self.memberships: dict[str, _Membership] = {}
         self.pending: OrderedDict[str, str] = OrderedDict()
         self.wakeup = asyncio.Event()
@@ -356,6 +370,7 @@ class _Session:
         self.closed = True
         for path in tuple(self.memberships):
             self.broker.remove(self, path)
+        self.pending.clear()
         for task in self.tasks:
             task.cancel()
         if self.control is not None and not self.control.sent.done():
@@ -365,8 +380,10 @@ class _Session:
         self.tasks = (
             asyncio.create_task(self._receive(), name="ws-receive"),
             asyncio.create_task(self._send(), name="ws-send"),
+            asyncio.create_task(self._wait_for_expiry(), name="ws-expiry"),
         )
         close_code = None
+        reason = ""
         try:
             completed, _ = await asyncio.wait(self.tasks, return_when=asyncio.FIRST_COMPLETED)
             for task in completed:
@@ -374,6 +391,7 @@ class _Session:
                     task.result()
         except _CloseSocket as exc:
             close_code = exc.code
+            reason = exc.reason
         except WebSocketDisconnect:
             pass
         except Exception:
@@ -383,19 +401,25 @@ class _Session:
             self.stop()
             # An ASGI request may itself be cancelled again during finalization.
             # Its cleanup remains broker-owned and is awaited at shutdown.
-            cleanup = self.broker.own(self._finish(close_code), "ws-cleanup")
+            cleanup = self.broker.own(self._finish(close_code, reason), "ws-cleanup")
             await asyncio.shield(cleanup)
 
-    async def _finish(self, close_code: int | None) -> None:
+    async def _finish(self, close_code: int | None, reason: str = "") -> None:
         try:
             await asyncio.gather(*self.tasks, return_exceptions=True)
             if close_code is not None:
-                try:
-                    await asyncio.wait_for(self.websocket.close(code=close_code), WS_SEND_TIMEOUT)
-                except (TimeoutError, WebSocketDisconnect, OSError, RuntimeError):
-                    logger.warning("Could not deliver WebSocket close %s", close_code, exc_info=True)
+                await _close_websocket(self.websocket, close_code, reason)
         finally:
             self.done.set()
+
+    def _check_expiry(self) -> None:
+        if self.expires_at <= time():
+            raise _CloseSocket(1008, "token_expired")
+
+    async def _wait_for_expiry(self) -> None:
+        while (remaining := self.expires_at - time()) > 0:
+            await asyncio.sleep(remaining)
+        raise _CloseSocket(1008, "token_expired")
 
     async def _reply(self, value: Any, arm: _Membership | None = None) -> None:
         sent = asyncio.get_running_loop().create_future()
@@ -424,7 +448,9 @@ class _Session:
 
     async def _send_text(self, text: str) -> None:
         try:
-            await asyncio.wait_for(self.websocket.send_text(text), WS_SEND_TIMEOUT)
+            async with asyncio.timeout(WS_SEND_TIMEOUT):
+                self._check_expiry()
+                await self.websocket.send_text(text)
         except TimeoutError as exc:
             raise _CloseSocket(1013) from exc
 
@@ -433,6 +459,7 @@ class _Session:
             message = await self.websocket.receive()
             if message["type"] == "websocket.disconnect":
                 return
+            self._check_expiry()
             if message.get("bytes") is not None:
                 raise _CloseSocket(1003)
             text = message["text"]

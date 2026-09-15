@@ -13,10 +13,30 @@ Fields
 Only the following service and device fields are accepted. Unknown fields fail
 validation, including misspelled options and ``startup_script``.
 
+``auth.profile``
+   Required nested profile table. The only implemented production profile is
+   ``type = "entra"``. There is no default profile, generic-JWT mode, dynamic
+   import/plugin option, authentication-disable flag or server client secret.
+
+``auth.profile.tenant_id`` and ``auth.profile.api_client_id``
+   Required UUIDs for the Entra Directory (tenant) ID and API Application
+   (client) ID. The latter is the client ID, not an Application ID URI or an
+   unrelated client application's ID. Unknown profile fields are rejected.
+
+``auth.allowed_origins``
+   Optional list of additional serialized browser origins; default ``[]`` keeps
+   same-origin-only browser access. Entries must have a hostname and no
+   credentials, trailing slash, path, query, fragment or wildcard. HTTPS is
+   accepted; HTTP is accepted only for literal ``localhost`` or a loopback IP
+   address, for example ``http://127.0.0.1:5173`` or ``http://[::1]:5173``.
+   Invalid ports are rejected. Strings are preserved exactly: use the origin
+   serialized by the browser, not a URL to a page. This list controls CORS and
+   additional WebSocket origins, never signing-key trust or reader permission.
+
 ``devices``
    Required table mapping root identifiers to device specifications. An explicit
-   empty ``[devices]`` table is valid and serves an empty device list; omitting the
-   table is an error.
+   empty ``[devices]`` table is valid with explicit authentication and serves an
+   empty authorized device list; omitting the table is an error.
 
 ``connect_timeout``
    Positive, finite seconds; default ``10.0``. Passed to native connection waits,
@@ -68,17 +88,124 @@ The repository's ``examples/sim.toml`` is included directly below:
 .. literalinclude:: ../../examples/sim.toml
    :language: toml
 
+Replace both deliberately invalid ``YOUR_...`` UUID placeholders before launch,
+and complete the Entra registration below. Hardware-free does not mean anonymous
+or identity-provider-free: production has no authentication bypass. Automated
+offline verification mocks discovery/JWKS HTTP requests, not token verification.
+
 Use the :doc:`installation` quickstart with ``OPHYD_CONTROL_LAYER=dummy`` set
 before launch. The declared ``sim`` extra supplies the upstream SimMotor import
 dependencies. This configuration constructs only an in-memory classic Signal
 and an async SimMotor; the service does not move even this simulated motor.
+
+Access-token profiles
+=====================
+
+Authentication is mandatory for every application REST resource and WebSocket
+connection, including loopback use. A provider-neutral RS256 JWT core owns
+signature and registered-claim verification, exact issuer/audience trust,
+discovery/JWKS retrieval and cache lifecycle. A required, reviewed profile owns
+access-token identification and reader authorization. Only the single-tenant,
+public-cloud Entra profile is currently selectable. Adding another provider
+requires reviewed code, a strict configuration variant, explicit factory
+dispatch and tests; a token cannot select a provider or signing endpoint.
+
+The selected profile supplies trusted HTTPS discovery and signing-key origins.
+Redirects, mismatched discovery issuers and out-of-scope JWKS URLs are rejected;
+token ``jku``/``x5u`` headers are not used. The HTTP client supports the operator's
+proxy and CA environment settings, verifies certificates, limits requests to
+5 seconds and complete refreshes to 10 seconds, and caps each document at 2 MiB.
+
+Keys load before readiness and refresh hourly. Unknown keys or expired caches
+share a refresh attempt with a five-minute minimum interval, including failed
+attempts. Failed refreshes preserve last-known-good keys for at most 24 hours
+since their last successful refresh. Successful refreshes replace the complete
+key set, retiring removed keys. Unusable trust fails closed, never anonymously.
+These are fixed service policies, not TOML tuning options. Tokens are limited to
+65,536 UTF-8 bytes; registered dates use a fixed 30-second clock tolerance.
+
+.. _entra-deployment:
+
+Entra deployment
+================
+
+The following settings are operator prerequisites, not actions performed by the
+service. No tenant registrations or real credentials are embedded in the example.
+
+1. Register a **single-tenant API application** for accounts in this organizational
+   directory only. Put its tenant and API client UUIDs in ``[auth.profile]`` with
+   ``type = "entra"``. Use Application ID URI ``api://<api_client_id>`` and set
+   ``api.requestedAccessTokenVersion`` to ``2``. This API needs no redirect URI or
+   client secret. Browser origins belong in ``[auth]``, not the profile table.
+
+2. Define an enabled app role with display name ``Ophyd Reader``, value
+   ``Ophyd.Reader``, and allowed member types **Users/Groups and Applications**.
+   Set **Assignment required? = Yes** on the API's Enterprise application.
+   Assign people directly, or assign a group where the tenant supports it; the
+   service checks the emitted role, not group membership. Assign service
+   principals and managed identities directly rather than relying on groups.
+   Guests also need explicit reader-role assignment. This one role grants equal
+   reader access to all configured resources, not per-device permissions.
+
+3. Expose delegated scope ``Ophyd.Read`` with **Admins only** consent. Register
+   the human client separately and grant that API permission with administrator
+   consent. Interactive public clients use authorization code with PKCE; their
+   redirect URI belongs to the client application, not this API. People need
+   both the reader-role assignment and the client's delegated permission.
+   Device-code acquisition is usable only if tenant policy permits it; no
+   password grant or server login/callback flow is implemented.
+
+4. Add the optional **access-token** claim ``idtyp`` with
+   ``additionalProperties: ["include_user_token"]`` on the API registration:
+
+   .. code-block:: json
+
+      {"optionalClaims":{"accessToken":[{"name":"idtyp","essential":false,"additionalProperties":["include_user_token"]}]}}
+
+   The profile requires v2 access-token markers with ``idtyp`` exactly ``user``
+   or ``app``, matching tenant UUID and valid object/client UUID claims. App
+   tokens must not contain ``scp``. All readers need the exact ``Ophyd.Reader``
+   role; users additionally need the space-delimited ``Ophyd.Read`` scope. Tenant
+   membership alone grants no access, and ID tokens are not accepted.
+
+5. For unattended callers, grant the API's ``Ophyd.Reader`` application
+   permission and tenant-admin consent. Request ``api://<api_client_id>/.default``;
+   prefer managed identity, workload federation or a certificate. Any caller
+   secret stays with that caller, never in the server's TOML. There is no local
+   user database, Microsoft Graph lookup, Redis lookup or token-acquisition flow.
+
+6. Clients send an **access token for this API**, never an ID token or a Microsoft
+   Graph token. HTTP and native WebSocket clients can send a Bearer header;
+   browser WebSockets authenticate in their first message. See :doc:`usage` for
+   the frames and authorization deadline. Obtain a renewed token and reconnect
+   before or at that deadline; in-place token refresh is not supported.
+
+7. Deploy behind HTTPS/WSS. An HTTP backend is acceptable only over a trusted
+   connection behind TLS termination. Keep the supported one-process launch
+   and loopback default. A reverse proxy must preserve the external Host/scheme
+   and trust forwarded headers only from its actual IPs; never expose a listener
+   with ``FORWARDED_ALLOW_IPS=*``. Forwarded identity headers are not credentials.
+   Redact Authorization and authentication-frame contents in proxy/application
+   diagnostics. Rate limiting and ingress connection limits remain deployment
+   controls, not an additional local authentication subsystem.
+
+8. Role removal or account disablement is **not instant access-token revocation**.
+   Already-issued tokens may authorize access until expiry plus the fixed
+   tolerance. WebSocket expiry prevents unlimited streaming, but no CAE,
+   revocation feed or Graph polling is claimed. Soft-device and mocked-identity
+   tests do not establish real-tenant interoperability or tenant policy; verify
+   authorized REST/needed WebSocket clients against your registration. An
+   unassigned caller may be denied token issuance by Entra, which is expected
+   with assignment required; do not disable that policy to manufacture a test
+   token. Driver trust and hardware-enforced read-only permissions still apply.
 
 Startup and ownership
 =====================
 
 A missing file, invalid TOML, duplicate TOML keys, missing required fields, or
 invalid field values fails startup with file/field context. After validation,
-roots are constructed and connected in configuration order. The application
+the authenticator loads trusted discovery/JWKS before constructing any root.
+Roots then construct and connect in configuration order. The application
 does not become ready until every root succeeds. An import, class, construction,
 or connection failure identifies the root/class and its underlying cause, cleans
 up already-owned resources, and exits nonzero instead of serving a partial
@@ -110,9 +237,9 @@ hardware-enforced protection. If a driver writes during initialization or needs
 preparation before reading, use a read-only driver/view instead; the service does
 not stage, trigger, move, or restore settings to make reads succeed.
 
-The unauthenticated service binds to ``127.0.0.1`` by default. Remote deployments
-need a trusted access boundary, such as an existing authenticated TLS reverse
-proxy. Read-only access is not confidentiality protection, and same-origin
-WebSocket checks are not authentication. See :doc:`introduction` for the service
-scope and :doc:`usage` for the wire contract. Soft-device verification does not
-establish native transport correctness or authorize access to live hardware.
+The service binds to ``127.0.0.1`` by default and requires reader authentication
+even there. Remote deployments need HTTPS/WSS and the trusted ingress settings
+above. Read-only access is not confidentiality protection; origin checks and
+CORS do not grant permission. See :doc:`introduction` for service scope and
+:doc:`usage` for the wire contract. Soft-device verification does not establish
+native transport correctness or authorize access to live hardware.

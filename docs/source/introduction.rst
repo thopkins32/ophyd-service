@@ -9,6 +9,12 @@ asyncio process constructs and owns configured roots for its lifetime. Clients
 use four GET routes and one multiplexed WebSocket per connection; there is no
 device worker service, RunEngine, queue or database to operate.
 
+JWT reader authentication protects every application REST resource and WebSocket
+connection. A provider-neutral RS256 core requires an explicit access-token
+profile; Microsoft Entra for one organizational tenant is the only production
+profile currently implemented. One assigned reader permission grants access to
+all configured resources. There are no login pages, cookies or anonymous mode.
+
 Start with :doc:`installation`, select installed driver classes and data-only
 constructor arguments in :doc:`configuration`, then follow :doc:`usage` for
 resource paths, native JSON data, errors and monitoring semantics. The bundled
@@ -30,8 +36,11 @@ would otherwise initialize or prepare hardware by writing. Use authoritative
 IOC/control-system permissions when hardware-enforced read-only access is
 required.
 
-The service is unauthenticated and binds to loopback by default. Remote use
-requires a trusted access boundary, such as an existing authenticated TLS
-reverse proxy. Read-only access does not provide confidentiality, and the
-WebSocket same-origin check is not authentication. Monitoring is coalesced
-latest state, not acquisition recording or proof of connectivity.
+The service requires authentication even on its loopback-default listener.
+Remote use needs HTTPS/WSS and trusted reverse-proxy/backend settings, not
+forwarded identity headers. Read-only access alone does not provide
+confidentiality; browser origin checks and CORS do not grant reader permission.
+Already-issued tokens may remain usable until expiry plus clock tolerance;
+streams close at that authorization deadline. Monitoring is coalesced latest
+state, not acquisition recording or proof of connectivity. See
+:doc:`configuration` for Entra deployment and revocation limits.

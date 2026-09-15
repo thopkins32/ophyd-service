@@ -144,7 +144,7 @@ class MalformedAsyncDevice(MutationGuard, StandardReadable):
 
 
 @pytest.fixture
-def monitor_service(tmp_path):
+def monitor_service(tmp_path, entra):
     with serving(
         tmp_path,
         """
@@ -153,6 +153,7 @@ class = "tests.devices:ClassicDevice"
 [devices.async]
 class = "tests.test_subscriptions:MonitoredAsyncDevice"
 """,
+        entra=entra,
     ) as (client, registry):
         classic = registry.roots["classic"]
         asynchronous = registry.roots["async"]
@@ -277,13 +278,14 @@ def test_shared_monitor_lifecycle_preserves_independent_native_listeners(monitor
         call_on_loop(registry, async_signal.clear_sub, async_listener)
 
 
-def test_aliases_share_by_object_identity_not_native_name(tmp_path):
+def test_aliases_share_by_object_identity_not_native_name(tmp_path, entra):
     with serving(
         tmp_path,
         """
 [devices.identity]
 class = "tests.test_subscriptions:IdentityAsyncDevice"
 """,
+        entra=entra,
     ) as (client, registry):
         device = registry.roots["identity"]
         assert device.first is device.alias
@@ -319,7 +321,7 @@ class = "tests.test_subscriptions:IdentityAsyncDevice"
         assert signal.forbidden_calls == []
 
 
-def test_classic_enum_monitor_uses_native_read_conversion(tmp_path, monkeypatch):
+def test_classic_enum_monitor_uses_native_read_conversion(tmp_path, monkeypatch, entra):
     with serving(
         tmp_path,
         """
@@ -329,6 +331,7 @@ class = "ophyd.sim:EnumSignal"
 enum_strings = ["off", "on"]
 value = 0
 """,
+        entra=entra,
     ) as (client, registry):
         signal = registry.roots["mode"]
         attempted = []
@@ -454,13 +457,14 @@ def test_cross_origin_clients_are_rejected_before_accept(monitor_service, origin
 
 
 @pytest.mark.parametrize("failure", ["backend_error", "serialization_error"])
-def test_classic_producer_errors_are_latest_state_and_recover(tmp_path, failure):
+def test_classic_producer_errors_are_latest_state_and_recover(tmp_path, failure, entra):
     with serving(
         tmp_path,
         """
 [devices.source]
 class = "tests.devices:GatedSignal"
 """,
+        entra=entra,
     ) as (client, registry):
         signal = registry.roots["source"]
         with client.websocket_connect("/api/v1/ws") as active:
@@ -489,13 +493,14 @@ class = "tests.devices:GatedSignal"
     assert signal.forbidden_calls == []
 
 
-def test_async_callback_serialization_failure_is_contained_and_recovers(tmp_path):
+def test_async_callback_serialization_failure_is_contained_and_recovers(tmp_path, entra):
     with serving(
         tmp_path,
         """
 [devices.async]
 class = "tests.test_subscriptions:MalformedAsyncDevice"
 """,
+        entra=entra,
     ) as (client, registry):
         device = registry.roots["async"]
         signal = device.temperature
@@ -529,7 +534,7 @@ class = "tests.test_subscriptions:MalformedAsyncDevice"
     assert device.forbidden_calls == signal.forbidden_calls == []
 
 
-def test_bad_initial_async_replay_fails_correlated_and_releases_callback(tmp_path):
+def test_bad_initial_async_replay_fails_correlated_and_releases_callback(tmp_path, entra):
     with serving(
         tmp_path,
         """
@@ -539,6 +544,7 @@ class = "tests.test_subscriptions:MalformedAsyncDevice"
 [devices.async.kwargs]
 invalid_initial = true
 """,
+        entra=entra,
     ) as (client, registry):
         device = registry.roots["async"]
         signal = device.temperature
@@ -695,17 +701,17 @@ class RaceSendMiddleware:
 
 
 @contextmanager
-def _race_serving(tmp_path, text, gate):
+def _race_serving(tmp_path, text, gate, *, entra):
     from fastapi.testclient import TestClient
 
     from ophyd_as_service.api import create_app
     from ophyd_as_service.config import load_config
 
     config = tmp_path / "race-devices.toml"
-    config.write_text(text)
+    config.write_text(entra.toml + text)
     app = create_app(load_config(config))
     app.add_middleware(RaceSendMiddleware, gate=gate)
-    with TestClient(app) as client:
+    with TestClient(app, headers=entra.headers) as client:
         yield client, app.state.registry
 
 
@@ -715,7 +721,7 @@ def _race_assert_reading(frame, path, value):
     assert frame["readings"][path]["value"] == value, frame
 
 
-def test_race_slow_socket_coalesces_latest_without_starving_pending_paths(tmp_path):
+def test_race_slow_socket_coalesces_latest_without_starving_pending_paths(tmp_path, entra):
     gate = RaceSendGate()
     with _race_serving(
         tmp_path,
@@ -726,6 +732,7 @@ class = "tests.test_subscriptions:RaceSoftSignal"
 class = "tests.test_subscriptions:RaceSoftSignal"
 """,
         gate,
+        entra=entra,
     ) as (client, registry):
         hot, other = registry.roots["hot"], registry.roots["other"]
         with client.websocket_connect("/api/v1/ws?slow=1") as slow:
@@ -767,7 +774,7 @@ class = "tests.test_subscriptions:RaceSoftSignal"
         assert hot.active_callbacks == other.active_callbacks == set()
 
 
-def test_race_unsubscribe_ack_is_barrier_after_an_inflight_frame(tmp_path):
+def test_race_unsubscribe_ack_is_barrier_after_an_inflight_frame(tmp_path, entra):
     gate = RaceSendGate()
     with _race_serving(
         tmp_path,
@@ -778,6 +785,7 @@ class = "tests.test_subscriptions:RaceSoftSignal"
 class = "tests.test_subscriptions:RaceSoftSignal"
 """,
         gate,
+        entra=entra,
     ) as (client, registry):
         hot, other = registry.roots["hot"], registry.roots["other"]
         with client.websocket_connect("/api/v1/ws?slow=1") as slow:
@@ -814,7 +822,7 @@ class = "tests.test_subscriptions:RaceSoftSignal"
 
 
 @pytest.mark.parametrize("first_exit", ["disconnect", "timeout"])
-def test_race_late_classic_registration_is_retired_before_reattach(tmp_path, first_exit):
+def test_race_late_classic_registration_is_retired_before_reattach(tmp_path, first_exit, entra):
     with serving(
         tmp_path,
         """
@@ -822,6 +830,7 @@ read_timeout = 0.15
 [devices.late]
 class = "tests.test_subscriptions:RaceLateSignal"
 """,
+        entra=entra,
     ) as (client, registry):
         signal = registry.roots["late"]
         signal.subscribe_release.clear()
@@ -877,7 +886,7 @@ class = "tests.test_subscriptions:RaceLateSignal"
     assert signal.destroy_calls == 1
 
 
-def test_race_old_classic_read_cannot_publish_into_replacement_generation(tmp_path):
+def test_race_old_classic_read_cannot_publish_into_replacement_generation(tmp_path, entra):
     with serving(
         tmp_path,
         """
@@ -885,6 +894,7 @@ read_timeout = 0.15
 [devices.source]
 class = "tests.test_subscriptions:RaceSnapshotSignal"
 """,
+        entra=entra,
     ) as (client, registry):
         signal = registry.roots["source"]
         try:
@@ -926,7 +936,7 @@ class = "tests.test_subscriptions:RaceSnapshotSignal"
     assert signal.unsubscription_tokens == signal.subscription_tokens
 
 
-def test_race_first_async_monitor_without_native_result_times_out_and_releases(tmp_path):
+def test_race_first_async_monitor_without_native_result_times_out_and_releases(tmp_path, entra):
     with serving(
         tmp_path,
         """
@@ -936,6 +946,7 @@ class = "tests.test_subscriptions:RaceSilentSignal"
 [devices.healthy]
 class = "tests.test_subscriptions:RaceSoftSignal"
 """,
+        entra=entra,
     ) as (client, registry):
         silent = registry.roots["silent"]
         with client.websocket_connect("/api/v1/ws") as socket:
@@ -953,7 +964,7 @@ class = "tests.test_subscriptions:RaceSoftSignal"
             _race_assert_reading(_receive(socket), "healthy", 7.0)
 
 
-def test_race_failed_native_removal_rejects_reattach_and_shutdown_cleans_other_roots(tmp_path, caplog):
+def test_race_failed_native_removal_rejects_reattach_and_shutdown_cleans_other_roots(tmp_path, caplog, entra):
     with pytest.raises(ExceptionGroup) as shutdown:
         with serving(
             tmp_path,
@@ -963,6 +974,7 @@ class = "tests.test_subscriptions:RaceRemovalFailureSignal"
 [devices.good]
 class = "tests.devices:ObservedSignal"
 """,
+            entra=entra,
         ) as (client, registry):
             bad, good = registry.roots["bad"], registry.roots["good"]
             with client.websocket_connect("/api/v1/ws") as socket:
@@ -1008,7 +1020,7 @@ class = "tests.devices:ObservedSignal"
     )
 
 
-def test_race_send_timeout_closes_socket_and_finishes_its_peer_and_native_monitor(tmp_path, monkeypatch):
+def test_race_send_timeout_closes_socket_and_finishes_its_peer_and_native_monitor(tmp_path, monkeypatch, entra):
     from starlette.websockets import WebSocketDisconnect
 
     import ophyd_as_service.subscriptions as subscriptions
@@ -1022,6 +1034,7 @@ def test_race_send_timeout_closes_socket_and_finishes_its_peer_and_native_monito
 class = "tests.test_subscriptions:RaceSoftSignal"
 """,
         gate,
+        entra=entra,
     ) as (client, registry):
         signal = registry.roots["source"]
         with client.websocket_connect("/api/v1/ws?slow=1") as socket:

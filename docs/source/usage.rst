@@ -5,9 +5,10 @@ Starting and Using the Server
 Launch
 ======
 
-Follow :doc:`installation` to prepare the environment and
-:doc:`configuration` to select installed driver classes. From the repository
-root, launch the hardware-free example with the dummy classic control layer:
+Follow :doc:`installation` to prepare the environment and :doc:`configuration`
+to select installed driver classes and complete Entra setup. Replace the example's
+tenant/API UUID placeholders before launching its soft devices with the dummy
+classic control layer:
 
 .. code-block:: console
 
@@ -16,10 +17,34 @@ root, launch the hardware-free example with the dummy classic control layer:
 The default address is ``http://127.0.0.1:8000``. The CLI accepts required
 ``--config`` and optional ``--host`` and ``--port`` options. It runs one asyncio
 server process, without reload; that process owns each configured root once,
-not once per request or WebSocket. Startup must connect every configured root
-before serving. Configuration and the exposed device tree are fixed until
-restart. Interactive HTTP documentation is available at ``/docs`` and
-``/redoc``, with the schema at ``/openapi.json``.
+not once per request or WebSocket. Startup must load trusted signing keys and
+connect every configured root before serving. Configuration and the exposed
+device tree are fixed until restart. Static ``/docs``, ``/redoc`` and
+``/openapi.json`` are public; they describe routes, not the configured inventory.
+
+Reader authentication
+=====================
+
+All four application GET routes and every WebSocket connection require a valid
+JWT **access token for this API** and reader authorization. The required profile
+is selected by server configuration, never by the token; Entra is the only
+implemented production profile. Its users need both ``Ophyd.Reader`` role and
+``Ophyd.Read`` delegated scope; app tokens need the role and must have no scope
+claim. An ID token or Microsoft Graph access token is not an API credential.
+See :ref:`entra-deployment` for registration, assignment and consent settings.
+
+HTTP clients send ``Authorization: Bearer <access_token>``. For example, after
+obtaining a token with your client and placing it in ``ACCESS_TOKEN``:
+
+.. code-block:: console
+
+   $ curl --header "Authorization: Bearer ${ACCESS_TOKEN}" http://127.0.0.1:8000/api/v1/read/temperature
+
+The ``JWTAccessToken`` HTTP bearer scheme in ``/docs`` permits manual token entry.
+The server provides no OAuth login, callback, cookies or local user database.
+Missing, empty, non-Bearer or multiple Authorization fields are rejected. Tokens
+in URLs, cookies, WebSocket subprotocols or forwarded-user headers are ignored.
+TLS and log redaction remain required; never put access tokens in URLs or logs.
 
 Resources and paths
 ===================
@@ -150,6 +175,15 @@ codes and HTTP status mapping are:
    * - Code
      - HTTP status
      - Meaning
+   * - ``unauthenticated``
+     - 401
+     - A valid access token is required; includes ``WWW-Authenticate: Bearer``.
+   * - ``forbidden``
+     - 403
+     - The verified access token lacks reader permission.
+   * - ``auth_unavailable``
+     - 503
+     - Usable signing-key trust is temporarily unavailable.
    * - ``not_found``
      - 404
      - The path is absent from the catalog.
@@ -177,6 +211,10 @@ responses. Unknown URLs and unsupported HTTP methods use ordinary routing
 404/405 responses rather than this service envelope. There are no application
 POST, PUT, PATCH or DELETE routes.
 
+Authentication failures have ``path: null`` and provider-neutral messages, not
+token contents or decoded claims. Signing-key retrieval/cache deadlines are
+independent of device workers and ``read_timeout``; see :doc:`configuration`.
+
 The positive, finite ``read_timeout`` (default 5 seconds) covers read,
 describe and monitor-start work, including waiting for classic worker capacity
 or a selected lazy child. ``connect_timeout`` (default 10 seconds) is passed
@@ -195,9 +233,39 @@ or trigger devices.
 Multiplexed WebSocket monitoring
 ================================
 
-Open one ``ws://127.0.0.1:8000/api/v1/ws`` connection and send repeated commands
-to monitor multiple admitted signal paths. All messages are UTF-8 JSON text
-frames. Each command has exactly three required string fields:
+Open one ``ws://127.0.0.1:8000/api/v1/ws`` connection. Native clients may supply
+the same Authorization header used for HTTP. A supplied header is authoritative:
+an invalid header never falls back to another credential source. A valid header
+authenticates the upgrade without an extra authentication frame, preserving the
+subscribe-acknowledgement/reading sequence below. Header failures use the service
+JSON HTTP denial response (401/403/503) when the ASGI denial extension is supported;
+otherwise admission fails closed with ASGI close 1008, or 1013 for key unavailability.
+
+Browser WebSocket APIs cannot set Authorization headers. A connection without
+that header is accepted only into a five-second authentication phase. Its first
+message must have exactly these fields:
+
+.. code-block:: json
+
+   {"op":"authenticate","access_token":"<access_token>"}
+
+Before subscribing, wait for the acknowledgement (deadline below is illustrative):
+
+.. code-block:: json
+
+   {"type":"authenticated","expires_at":1893456030}
+
+``expires_at`` is UNIX seconds including the fixed 30-second clock tolerance.
+No broker session, device subscription or reading exists before authentication.
+Missing/timed-out/malformed authentication or a different first operation receives
+one generic error with ``id: null`` and ``path: null``, then close 1008. A forbidden
+reader also closes 1008; signing-key unavailability closes 1013. Binary and oversized
+first frames retain the 1003/1009 limits described below. All authentication sends
+and closes are bounded; the acknowledgement cannot outlive authorization.
+
+After authentication, send repeated commands to monitor multiple admitted signal
+paths. All messages are UTF-8 JSON text frames. Each command has exactly three
+required string fields:
 
 * ``id``: nonempty, at most 64 characters, echoed in the command reply.
 * ``op``: exactly ``subscribe`` or ``unsubscribe``.
@@ -245,6 +313,14 @@ Uvicorn launch both enforce this limit. A send stalled for 5 seconds causes
 cleanup and an attempted close with 1013; delivery of a close frame to a
 stalled peer is not guaranteed.
 
+Every stream ends at its effective authorization deadline, even when quiet, with
+close code 1008 and reason ``token_expired``. No new command or data send starts
+after expiry; a transmission already in progress cannot be recalled. Expiry
+removes only that socket's memberships and pending frames, leaving other readers
+of shared sources authorized. Obtain a renewed access token and reconnect before
+or at the deadline. Another ``authenticate`` frame cannot refresh the token or
+replace the connection's identity.
+
 Ordering and latest-state delivery
 ----------------------------------
 
@@ -290,7 +366,8 @@ invalidate a shared native ``read()`` result; callbacks themselves do no I/O.
 Async ``subscribe_reading`` notifications already contain readings and do not
 cause extra reads. Neither branch stages a signal to keep monitoring alive.
 
-Unsubscribe, disconnect and shutdown remove only the service's owned classic
+Once no clients remain, unsubscribe, disconnect, authorization expiry and
+shutdown remove only the service's owned classic
 token or exact async callback, after settling in-flight registration work.
 Late callbacks cannot revive a removed membership. An unsubscribe
 acknowledgement promises the delivery barrier, not immediate native transport
@@ -300,10 +377,12 @@ them. The service does not remove unrelated listeners or promise universal
 transport disconnection. Native removal failures are logged and prevent
 reattachment to that source rather than guessing that cleanup succeeded.
 
-Before accepting a browser WebSocket, the server requires its ``Origin``
-scheme, host and port to match the request's effective HTTP(S) origin.
-``Origin: null`` and mismatched origins are rejected; native clients may omit
-``Origin``. CORS is not enabled. This check is not authentication or general
-host authorization. Keep the loopback default, or supply a trusted access
-boundary for remote use; see :doc:`introduction` for the read-only safety
-boundary.
+Before accepting a browser WebSocket, the server requires its ``Origin`` to
+match the request's effective HTTP(S) scheme/host/port or an exact additional
+``auth.allowed_origins`` entry. ``Origin: null`` and other mismatches are rejected;
+native clients may omit Origin. Every permitted origin still needs a reader token.
+With a nonempty origin list, CORS allows exactly those origins, GET and the
+Authorization header, without credential cookies. Otherwise CORS is disabled.
+Preflight is public but cannot touch devices, and CORS never grants permission.
+See :doc:`configuration` for trusted proxy/HTTPS settings and
+:doc:`introduction` for the read-only safety boundary.

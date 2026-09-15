@@ -14,12 +14,14 @@ classifiers = [
 ]
 description = "REST API Server for Ophyd Objects."
 dependencies = [
-    "fastapi",
+    "fastapi>=0.141.1,<1",
+    "httpx>=0.28.1,<1",
     "numpy",
     "ophyd>=1.11.2,<2",
     "ophyd-async>=0.21.2,<0.22",
     "orjson>=3.10,<4",
     "pydantic>=2,<3",
+    "PyJWT[crypto]>=2.14,<3",
     "uvicorn",
     "websockets",
 ]
@@ -40,7 +42,6 @@ dev = [
     "cryptography",
     "fastapi[all]",
     "flake8",
-    "httpx",
     "pre-commit",
     "pytest",
     "pytest-asyncio",

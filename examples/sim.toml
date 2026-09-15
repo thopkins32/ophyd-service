@@ -1,6 +1,14 @@
 connect_timeout = 10.0
 read_timeout = 5.0
 
+[auth]
+allowed_origins = []
+
+[auth.profile]
+type = "entra"
+tenant_id = "YOUR_ENTRA_TENANT_ID"
+api_client_id = "YOUR_API_APPLICATION_CLIENT_ID"
+
 [devices.temperature]
 class = "ophyd:Signal"
 [devices.temperature.kwargs]
